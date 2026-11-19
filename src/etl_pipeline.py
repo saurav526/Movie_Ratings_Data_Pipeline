@@ -14,7 +14,6 @@ Combines raw_movie_details.csv and raw_movie_ratings.csv:
    - ratings (cleaned individual rating logs)
    - pipeline_audit (ETL lineage & data quality audit metrics)
 """
-
 import os
 import json
 import sqlite3
