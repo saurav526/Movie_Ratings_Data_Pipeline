@@ -1,0 +1,30 @@
+{
+  "run_timestamp": "2026-11-19 22:41:42",
+  "raw_movies_rows": 128,
+  "raw_ratings_rows": 7975,
+  "missing_values_before": {
+    "genres": 6,
+    "director": 10,
+    "runtime_min": 12,
+    "budget_musd": 13,
+    "box_office_musd": 13,
+    "content_rating": 9
+  },
+  "duplicate_movie_titles_merged": 18,
+  "clean_movies_rows": 110,
+  "missing_values_after": {
+    "genres": 0,
+    "director": 0,
+    "runtime_min": 0,
+    "budget_musd": 0,
+    "box_office_musd": 0,
+    "content_rating": 0
+  },
+  "ratings_remapped_from_duplicate_titles": 251,
+  "orphan_ratings_removed": 35,
+  "null_ratings_removed": 97,
+  "out_of_bounds_ratings_removed": 22,
+  "duplicate_user_ratings_removed": 311,
+  "clean_ratings_rows": 7510,
+  "unique_genres_count": 18
+}
