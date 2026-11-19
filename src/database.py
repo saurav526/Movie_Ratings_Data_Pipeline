@@ -3,7 +3,6 @@ SQL Analytics & Query Engine for Movie Ratings Data Pipeline
 Provides parameterized SQL queries against the SQLite / PostgreSQL-compatible database
 for filtering, aggregations, genre matrices, top-rated leaderboards, and interactive SQL exploration.
 """
-
 import os
 import sqlite3
 import json
