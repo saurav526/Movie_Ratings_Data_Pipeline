@@ -12,7 +12,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "data", "cinema_analytics.db")
 RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
 PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
-
+# the database use for the ETL pipeline and SQL queries is SQLite, but the schema and queries are compatible with PostgreSQL for future scalability
 
 def ensure_database():
     """Ensures the database and processed datasets exist; runs ETL if not present."""
