@@ -21,7 +21,8 @@ np.random.seed(SEED)
 
 RAW_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "raw")
 
-# 110 Real-Life Iconic Movies:
+# 110 Real-Life Iconic Movies: 
+# movies with authentic release years, genres, directors, runtimes, budgets, box office, studios,
 # (Title, Year, Genres, Director, Runtime_min, Budget_MUSD, BoxOffice_MUSD, Language, Rating_Cert, Studio, True_IMDb_Mean, Popularity_Weight, Synopsis)
 REAL_MOVIES = [
     ("The Shawshank Redemption", 1994, "Drama|Crime", "Frank Darabont", 142, 25.0, 73.3, "English", "R", "Castle Rock Entertainment", 9.3, 3.8, "Over the course of several years, two convicts form a friendship, seeking consolation and, eventually, redemption through basic compassion."),
