@@ -1,5 +1,5 @@
 """
-Movie Ratings Data Pipeline & SQL Warehouse Engine
+Movie Ratings Data Pipeline & PostgreSQL Warehouse Engine
 Combines raw_movie_details.csv and raw_movie_ratings.csv:
 1. Cleans and normalizes movie titles (casing, whitespace, punctuation).
 2. Deduplicates duplicate movie titles while preserving a mapping from duplicate movie_ids
@@ -8,26 +8,52 @@ Combines raw_movie_details.csv and raw_movie_ratings.csv:
 4. Cleans ratings dataset: remaps duplicate movie_ids, removes null/out-of-bounds ratings,
    deduplicates repeat (user_id, movie_id) ratings, and filters out orphan movie_ids.
 5. Computes IMDB-style Bayesian Weighted Ratings (WR) & Audience Popularity Indices.
-6. Loads normalized tables into an SQL Database (SQLite / PostgreSQL compatible via SQLAlchemy/sqlite3):
+6. Loads normalized tables into a PostgreSQL Database (`movie_ratings_db`) via psycopg2 & SQLAlchemy:
    - movies (canonical cleaned movies + aggregated metrics)
    - movie_genres (normalized 1-to-many genre bridge table for fast SQL genre analytics)
    - ratings (cleaned individual rating logs)
    - pipeline_audit (ETL lineage & data quality audit metrics)
 """
+
 import os
 import json
-import sqlite3
 import numpy as np
 import pandas as pd
+import psycopg2
+from psycopg2 import sql
+from psycopg2.extras import execute_values
 from datetime import datetime
-
-# --- IGNORE ---
-# ETL pipeline and SQL warehouse engine for movie ratings data. The database used is SQLite, but the schema and queries are compatible with PostgreSQL for future scalability.
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
 PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
-DB_PATH = os.path.join(BASE_DIR, "data", "cinema_analytics.db")
+
+PG_CONFIG = {
+    "host": os.environ.get("PG_HOST", "localhost"),
+    "port": int(os.environ.get("PG_PORT", 5432)),
+    "database": os.environ.get("PG_DATABASE", "movie_ratings_db"),
+    "user": os.environ.get("PG_USER", "postgres"),
+    "password": os.environ.get("PG_PASSWORD", "3748"),
+}
+
+
+def create_postgres_database():
+    """Creates the PostgreSQL database `movie_ratings_db` if it does not already exist."""
+    conn = psycopg2.connect(
+        host=PG_CONFIG["host"],
+        port=PG_CONFIG["port"],
+        database="postgres",
+        user=PG_CONFIG["user"],
+        password=PG_CONFIG["password"],
+    )
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM pg_database WHERE datname = %s;", (PG_CONFIG["database"],))
+    exists = cur.fetchone()
+    if not exists:
+        cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(PG_CONFIG["database"])))
+    cur.close()
+    conn.close()
 
 
 def normalize_title(t: str) -> str:
@@ -36,7 +62,6 @@ def normalize_title(t: str) -> str:
     cleaned = " ".join(str(t).strip().split())
     words = cleaned.split(" ")
     small_words = {"of", "in", "the", "and", "to", "a", "an", "on", "at", "for", "v"}
-    roman_or_acronyms = {"ii", "iii", "iv", "v", "vi", "wall-e"}
     result = []
     for i, w in enumerate(words):
         wl = w.lower()
@@ -47,7 +72,6 @@ def normalize_title(t: str) -> str:
         elif i > 0 and wl in small_words:
             result.append(wl)
         else:
-            # Preserve hyphenated capitalization like Spider-Man or Spider-Verse or Vol.
             if "-" in w:
                 result.append("-".join(part.capitalize() for part in w.split("-")))
             else:
@@ -56,7 +80,7 @@ def normalize_title(t: str) -> str:
 
 
 def run_etl_pipeline() -> dict:
-    """Executes the full extract-transform-load pipeline and returns audit statistics."""
+    """Executes the full extract-transform-load pipeline into PostgreSQL and returns audit statistics."""
     os.makedirs(PROCESSED_DIR, exist_ok=True)
 
     raw_movies_path = os.path.join(RAW_DIR, "raw_movie_details.csv")
@@ -80,17 +104,14 @@ def run_etl_pipeline() -> dict:
     df_movies["clean_title"] = df_movies["title"].apply(normalize_title)
     df_movies["title_key"] = df_movies["clean_title"].str.lower()
 
-    # Count missing values before cleaning
     audit["missing_values_before"] = {
         col: int(df_movies[col].isna().sum())
         for col in ["genres", "director", "runtime_min", "budget_musd", "box_office_musd", "content_rating"]
     }
 
-    # Sort by number of non-null attributes and smaller movie_id so canonical record is the most complete one
     df_movies["non_null_count"] = df_movies.notna().sum(axis=1)
     df_movies = df_movies.sort_values(by=["title_key", "non_null_count", "movie_id"], ascending=[True, False, True])
 
-    # Build mapping from duplicate movie_id -> canonical movie_id
     id_mapping = {}
     canonical_rows = []
     duplicate_titles_found = 0
@@ -102,7 +123,6 @@ def run_etl_pipeline() -> dict:
         for _, row in group.iterrows():
             id_mapping[row["movie_id"]] = canonical_id
 
-        # Coalesce non-null values across duplicate rows for the same title
         first_valid = {}
         for col in group.columns:
             non_null_vals = group[col].dropna()
@@ -124,7 +144,6 @@ def run_etl_pipeline() -> dict:
     df_clean_movies["content_rating"] = df_clean_movies["content_rating"].fillna("PG-13")
     df_clean_movies["language"] = df_clean_movies["language"].fillna("English")
 
-    # Numeric median imputation grouped by primary_genre
     for num_col in ["runtime_min", "budget_musd", "box_office_musd"]:
         genre_medians = df_clean_movies.groupby("primary_genre")[num_col].transform("median")
         global_median = df_clean_movies[num_col].median()
@@ -147,30 +166,25 @@ def run_etl_pipeline() -> dict:
     df_ratings = df_ratings_raw.copy()
     df_ratings.rename(columns={"review_Platform": "review_platform"}, inplace=True)
 
-    # 3a. Remap duplicate movie IDs to their canonical movie ID
     remapped_count = int(df_ratings["movie_id"].isin(
         {k for k, v in id_mapping.items() if k != v}
     ).sum())
     df_ratings["movie_id"] = df_ratings["movie_id"].map(lambda x: id_mapping.get(x, x))
     audit["ratings_remapped_from_duplicate_titles"] = remapped_count
 
-    # 3b. Remove orphan ratings (movie_id not in canonical movies)
     valid_movie_ids = set(df_clean_movies["movie_id"])
     orphan_mask = ~df_ratings["movie_id"].isin(valid_movie_ids)
     audit["orphan_ratings_removed"] = int(orphan_mask.sum())
     df_ratings = df_ratings[~orphan_mask].copy()
 
-    # 3c. Remove missing ratings
     null_rating_mask = df_ratings["rating"].isna()
     audit["null_ratings_removed"] = int(null_rating_mask.sum())
     df_ratings = df_ratings[~null_rating_mask].copy()
 
-    # 3d. Remove out-of-bounds ratings (< 1.0 or > 10.0)
     oob_mask = (df_ratings["rating"] < 1.0) | (df_ratings["rating"] > 10.0)
     audit["out_of_bounds_ratings_removed"] = int(oob_mask.sum())
     df_ratings = df_ratings[~oob_mask].copy()
 
-    # 3e. Deduplicate (user_id, movie_id) keeping the most recent rating
     df_ratings = df_ratings.sort_values("rated_at", ascending=False)
     before_dedup = len(df_ratings)
     df_ratings = df_ratings.drop_duplicates(subset=["user_id", "movie_id"], keep="first").copy()
@@ -201,7 +215,6 @@ def run_etl_pipeline() -> dict:
     df_integrated["total_helpful_votes"] = df_integrated["total_helpful_votes"].fillna(0).astype(int)
     df_integrated["verified_ratio"] = df_integrated["verified_ratio"].fillna(75.0)
 
-    # Bayesian Weighted Rating (IMDB formula): WR = (v / (v + m)) * R + (m / (v + m)) * C
     m_quantile = float(np.percentile(df_integrated["rating_count"], 40))
     v = df_integrated["rating_count"]
     R = df_integrated["avg_rating"]
@@ -209,7 +222,6 @@ def run_etl_pipeline() -> dict:
         (v / (v + m_quantile)) * R + (m_quantile / (v + m_quantile)) * global_C
     ).round(2)
 
-    # Composite Popularity Score (0 - 100 scale combining rating volume, helpful votes, and box office)
     v_norm = (df_integrated["rating_count"] - df_integrated["rating_count"].min()) / (
         df_integrated["rating_count"].max() - df_integrated["rating_count"].min() + 1e-6
     )
@@ -219,7 +231,6 @@ def run_etl_pipeline() -> dict:
     w_norm = (df_integrated["weighted_score"] - 1.0) / 9.0
     df_integrated["popularity_index"] = ((0.50 * v_norm + 0.30 * w_norm + 0.20 * bo_norm) * 100).round(1)
 
-    # Audience Sentiment Tier
     def assign_tier(score):
         if score >= 8.2:
             return "Masterpiece (8.2+)"
@@ -251,61 +262,80 @@ def run_etl_pipeline() -> dict:
     with open(os.path.join(PROCESSED_DIR, "pipeline_audit.json"), "w", encoding="utf-8") as f:
         json.dump(audit, f, indent=2)
 
-    # --- STEP 6: Load into SQLite Relational Warehouse ---
-    conn = sqlite3.connect(DB_PATH)
+    # --- STEP 6: Load into PostgreSQL Relational Warehouse ---
+    create_postgres_database()
+
+    conn = psycopg2.connect(
+        host=PG_CONFIG["host"],
+        port=PG_CONFIG["port"],
+        database=PG_CONFIG["database"],
+        user=PG_CONFIG["user"],
+        password=PG_CONFIG["password"],
+    )
     cursor = conn.cursor()
 
-    cursor.executescript("""
-        DROP TABLE IF EXISTS movie_genres;
-        DROP TABLE IF EXISTS ratings;
-        DROP TABLE IF EXISTS movies;
-        DROP TABLE IF EXISTS pipeline_audit;
+    cursor.execute("""
+        DROP TABLE IF EXISTS movie_genres CASCADE;
+        DROP TABLE IF EXISTS ratings CASCADE;
+        DROP TABLE IF EXISTS movies CASCADE;
+        DROP TABLE IF EXISTS pipeline_audit CASCADE;
 
         CREATE TABLE movies (
-            movie_id TEXT PRIMARY KEY,
+            movie_id VARCHAR(20) PRIMARY KEY,
             title TEXT NOT NULL,
             release_year INTEGER,
-            decade TEXT,
+            decade VARCHAR(10),
             genres TEXT,
-            primary_genre TEXT,
+            primary_genre VARCHAR(50),
             director TEXT,
             runtime_min INTEGER,
-            budget_musd REAL,
-            box_office_musd REAL,
-            roi_pct REAL,
-            language TEXT,
-            content_rating TEXT,
+            budget_musd NUMERIC(10, 2),
+            box_office_musd NUMERIC(10, 2),
+            roi_pct NUMERIC(10, 1),
+            language VARCHAR(50),
+            content_rating VARCHAR(20),
             production_studio TEXT,
             synopsis TEXT,
             rating_count INTEGER,
-            avg_rating REAL,
-            median_rating REAL,
-            rating_std REAL,
-            weighted_score REAL,
-            popularity_index REAL,
+            avg_rating NUMERIC(4, 2),
+            median_rating NUMERIC(4, 2),
+            rating_std NUMERIC(4, 2),
+            weighted_score NUMERIC(4, 2),
+            popularity_index NUMERIC(5, 1),
             total_helpful_votes INTEGER,
-            verified_ratio REAL,
-            audience_tier TEXT
+            verified_ratio NUMERIC(5, 1),
+            audience_tier VARCHAR(50)
         );
 
         CREATE TABLE movie_genres (
-            movie_id TEXT,
-            genre TEXT,
-            PRIMARY KEY (movie_id, genre),
-            FOREIGN KEY (movie_id) REFERENCES movies(movie_id)
+            movie_id VARCHAR(20) REFERENCES movies(movie_id) ON DELETE CASCADE,
+            genre VARCHAR(50),
+            PRIMARY KEY (movie_id, genre)
         );
 
         CREATE TABLE ratings (
-            rating_id TEXT PRIMARY KEY,
-            movie_id TEXT,
-            user_id TEXT,
-            rating REAL,
-            review_platform TEXT,
-            viewer_age_group TEXT,
+            rating_id VARCHAR(25) PRIMARY KEY,
+            movie_id VARCHAR(20) REFERENCES movies(movie_id) ON DELETE CASCADE,
+            user_id VARCHAR(25),
+            rating NUMERIC(4, 1),
+            review_platform VARCHAR(50),
+            viewer_age_group VARCHAR(20),
             is_verified_viewer BOOLEAN,
             helpful_votes INTEGER,
-            rated_at TEXT,
-            FOREIGN KEY (movie_id) REFERENCES movies(movie_id)
+            rated_at TIMESTAMP
+        );
+
+        CREATE TABLE pipeline_audit (
+            run_timestamp TEXT,
+            raw_movies_rows INTEGER,
+            clean_movies_rows INTEGER,
+            duplicate_titles_merged INTEGER,
+            raw_ratings_rows INTEGER,
+            clean_ratings_rows INTEGER,
+            duplicate_user_ratings_removed INTEGER,
+            orphan_ratings_removed INTEGER,
+            null_or_oob_ratings_removed INTEGER,
+            audit_json TEXT
         );
 
         CREATE INDEX idx_movies_year ON movies(release_year);
@@ -315,25 +345,73 @@ def run_etl_pipeline() -> dict:
         CREATE INDEX idx_ratings_movie_id ON ratings(movie_id);
     """)
 
-    df_integrated.to_sql("movies", conn, if_exists="append", index=False)
-    df_movie_genres.to_sql("movie_genres", conn, if_exists="append", index=False)
-    df_ratings.to_sql("ratings", conn, if_exists="append", index=False)
+    movie_cols = [
+        "movie_id", "title", "release_year", "decade", "genres", "primary_genre",
+        "director", "runtime_min", "budget_musd", "box_office_musd", "roi_pct",
+        "language", "content_rating", "production_studio", "synopsis",
+        "rating_count", "avg_rating", "median_rating", "rating_std",
+        "weighted_score", "popularity_index", "total_helpful_votes",
+        "verified_ratio", "audience_tier"
+    ]
+    movies_tuples = [
+        tuple(None if pd.isna(val) else (val.item() if hasattr(val, "item") else val) for val in row)
+        for row in df_integrated[movie_cols].to_numpy()
+    ]
+    execute_values(
+        cursor,
+        f"INSERT INTO movies ({', '.join(movie_cols)}) VALUES %s",
+        movies_tuples
+    )
 
-    audit_df = pd.DataFrame([{
-        "run_timestamp": audit["run_timestamp"],
-        "raw_movies_rows": audit["raw_movies_rows"],
-        "clean_movies_rows": audit["clean_movies_rows"],
-        "duplicate_titles_merged": audit["duplicate_movie_titles_merged"],
-        "raw_ratings_rows": audit["raw_ratings_rows"],
-        "clean_ratings_rows": audit["clean_ratings_rows"],
-        "duplicate_user_ratings_removed": audit["duplicate_user_ratings_removed"],
-        "orphan_ratings_removed": audit["orphan_ratings_removed"],
-        "null_or_oob_ratings_removed": audit["null_ratings_removed"] + audit["out_of_bounds_ratings_removed"],
-        "audit_json": json.dumps(audit)
-    }])
-    audit_df.to_sql("pipeline_audit", conn, if_exists="replace", index=False)
+    genres_tuples = [tuple(x) for x in df_movie_genres[["movie_id", "genre"]].to_numpy()]
+    execute_values(
+        cursor,
+        "INSERT INTO movie_genres (movie_id, genre) VALUES %s",
+        genres_tuples
+    )
+
+    rating_cols = [
+        "rating_id", "movie_id", "user_id", "rating", "review_platform",
+        "viewer_age_group", "is_verified_viewer", "helpful_votes", "rated_at"
+    ]
+    ratings_tuples = [
+        tuple(
+            bool(val) if col == "is_verified_viewer"
+            else (val.item() if hasattr(val, "item") else val)
+            for col, val in zip(rating_cols, row)
+        )
+        for row in df_ratings[rating_cols].to_numpy()
+    ]
+    execute_values(
+        cursor,
+        f"INSERT INTO ratings ({', '.join(rating_cols)}) VALUES %s",
+        ratings_tuples
+    )
+
+    cursor.execute(
+        """
+        INSERT INTO pipeline_audit (
+            run_timestamp, raw_movies_rows, clean_movies_rows, duplicate_titles_merged,
+            raw_ratings_rows, clean_ratings_rows, duplicate_user_ratings_removed,
+            orphan_ratings_removed, null_or_oob_ratings_removed, audit_json
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+        """,
+        (
+            audit["run_timestamp"],
+            audit["raw_movies_rows"],
+            audit["clean_movies_rows"],
+            audit["duplicate_movie_titles_merged"],
+            audit["raw_ratings_rows"],
+            audit["clean_ratings_rows"],
+            audit["duplicate_user_ratings_removed"],
+            audit["orphan_ratings_removed"],
+            audit["null_ratings_removed"] + audit["out_of_bounds_ratings_removed"],
+            json.dumps(audit),
+        ),
+    )
 
     conn.commit()
+    cursor.close()
     conn.close()
 
     return audit
@@ -341,5 +419,5 @@ def run_etl_pipeline() -> dict:
 
 if __name__ == "__main__":
     stats = run_etl_pipeline()
-    print("ETL Pipeline completed successfully:")
+    print("ETL Pipeline completed successfully into PostgreSQL:")
     print(json.dumps(stats, indent=2))

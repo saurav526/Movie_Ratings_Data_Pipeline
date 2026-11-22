@@ -1,44 +1,85 @@
 """
-SQL Analytics & Query Engine for Movie Ratings Data Pipeline
-Provides parameterized SQL queries against the SQLite / PostgreSQL-compatible database
+PostgreSQL Analytics & Query Engine for Movie Ratings Data Pipeline
+Provides parameterized SQL queries against the PostgreSQL relational warehouse (`movie_ratings_db`)
 for filtering, aggregations, genre matrices, top-rated leaderboards, and interactive SQL exploration.
 """
+
 import os
-import sqlite3
 import json
 import pandas as pd
+import psycopg2
+from src.etl_pipeline import PG_CONFIG, run_etl_pipeline
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(BASE_DIR, "data", "cinema_analytics.db")
 RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
 PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
-# the database use for the ETL pipeline and SQL queries is SQLite, but the schema and queries are compatible with PostgreSQL for future scalability
+
 
 def ensure_database():
-    """Ensures the database and processed datasets exist; runs ETL if not present."""
-    if not os.path.exists(DB_PATH):
-        from src.etl_pipeline import run_etl_pipeline
+    """Ensures the PostgreSQL database `movie_ratings_db` and tables exist; runs ETL if not present."""
+    try:
+        conn = psycopg2.connect(
+            host=PG_CONFIG["host"],
+            port=PG_CONFIG["port"],
+            database=PG_CONFIG["database"],
+            user=PG_CONFIG["user"],
+            password=PG_CONFIG["password"],
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT to_regclass('public.movies');")
+        exists = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        if not exists:
+            run_etl_pipeline()
+    except psycopg2.OperationalError:
         run_etl_pipeline()
 
 
 def get_connection():
     ensure_database()
-    return sqlite3.connect(DB_PATH)
+    return psycopg2.connect(
+        host=PG_CONFIG["host"],
+        port=PG_CONFIG["port"],
+        database=PG_CONFIG["database"],
+        user=PG_CONFIG["user"],
+        password=PG_CONFIG["password"],
+    )
+
+
+def _fetch_df(sql: str, params=None) -> pd.DataFrame:
+    """Executes a parameterized query on PostgreSQL via psycopg2 and returns a DataFrame with float types normalized."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        cols = [desc[0] for desc in cur.description]
+        rows = cur.fetchall()
+        cur.close()
+        df = pd.DataFrame(rows, columns=cols)
+        # Convert Decimal columns to float for seamless Pandas/Plotly compatibility
+        for col in df.columns:
+            if df[col].dtype == "object" and len(df) > 0:
+                first_non_null = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
+                if hasattr(first_non_null, "as_tuple"):  # decimal.Decimal
+                    df[col] = df[col].astype(float)
+        return df
+    finally:
+        conn.close()
 
 
 def get_pipeline_audit() -> dict:
+    ensure_database()
     audit_path = os.path.join(PROCESSED_DIR, "pipeline_audit.json")
     if not os.path.exists(audit_path):
-        from src.etl_pipeline import run_etl_pipeline
         return run_etl_pipeline()
     with open(audit_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def get_filter_bounds() -> dict:
-    conn = get_connection()
-    genres_df = pd.read_sql_query("SELECT DISTINCT genre FROM movie_genres ORDER BY genre;", conn)
-    bounds_df = pd.read_sql_query("""
+    genres_df = _fetch_df("SELECT DISTINCT genre FROM movie_genres ORDER BY genre;")
+    bounds_df = _fetch_df("""
         SELECT
             MIN(release_year) AS min_year,
             MAX(release_year) AS max_year,
@@ -49,10 +90,9 @@ def get_filter_bounds() -> dict:
             MIN(rating_count) AS min_votes,
             MAX(rating_count) AS max_votes
         FROM movies;
-    """, conn)
-    langs_df = pd.read_sql_query("SELECT DISTINCT language FROM movies ORDER BY language;", conn)
-    certs_df = pd.read_sql_query("SELECT DISTINCT content_rating FROM movies ORDER BY content_rating;", conn)
-    conn.close()
+    """)
+    langs_df = _fetch_df("SELECT DISTINCT language FROM movies ORDER BY language;")
+    certs_df = _fetch_df("SELECT DISTINCT content_rating FROM movies ORDER BY content_rating;")
 
     row = bounds_df.iloc[0]
     return {
@@ -80,34 +120,33 @@ def query_filtered_movies(
     certificates: list = None,
     search_query: str = ""
 ) -> pd.DataFrame:
-    """Executes an SQL query joining `movies` and `movie_genres` with dynamic filters."""
-    conn = get_connection()
+    """Executes a PostgreSQL query joining `movies` and `movie_genres` with dynamic filters."""
     params = [year_range[0], year_range[1], min_rating, min_popularity, min_votes]
 
     where_clauses = [
-        "m.release_year BETWEEN ? AND ?",
-        "m.weighted_score >= ?",
-        "m.popularity_index >= ?",
-        "m.rating_count >= ?"
+        "m.release_year BETWEEN %s AND %s",
+        "m.weighted_score >= %s",
+        "m.popularity_index >= %s",
+        "m.rating_count >= %s"
     ]
 
     if genres:
-        placeholders = ",".join(["?"] * len(genres))
+        placeholders = ",".join(["%s"] * len(genres))
         where_clauses.append(f"m.movie_id IN (SELECT movie_id FROM movie_genres WHERE genre IN ({placeholders}))")
         params.extend(genres)
 
     if languages:
-        placeholders = ",".join(["?"] * len(languages))
+        placeholders = ",".join(["%s"] * len(languages))
         where_clauses.append(f"m.language IN ({placeholders})")
         params.extend(languages)
 
     if certificates:
-        placeholders = ",".join(["?"] * len(certificates))
+        placeholders = ",".join(["%s"] * len(certificates))
         where_clauses.append(f"m.content_rating IN ({placeholders})")
         params.extend(certificates)
 
     if search_query and search_query.strip():
-        where_clauses.append("(LOWER(m.title) LIKE ? OR LOWER(m.director) LIKE ?)")
+        where_clauses.append("(LOWER(m.title) LIKE %s OR LOWER(m.director) LIKE %s)")
         q = f"%{search_query.strip().lower()}%"
         params.extend([q, q])
 
@@ -117,17 +156,14 @@ def query_filtered_movies(
         WHERE {' AND '.join(where_clauses)}
         ORDER BY m.weighted_score DESC, m.popularity_index DESC;
     """
-    df = pd.read_sql_query(sql, conn, params=params)
-    conn.close()
-    return df
+    return _fetch_df(sql, params)
 
 
 def query_genre_aggregation(movie_ids: list) -> pd.DataFrame:
-    """SQL aggregation across the normalized `movie_genres` bridge table for filtered movies."""
+    """PostgreSQL aggregation across the normalized `movie_genres` bridge table for filtered movies."""
     if not movie_ids:
         return pd.DataFrame()
-    conn = get_connection()
-    placeholders = ",".join(["?"] * len(movie_ids))
+    placeholders = ",".join(["%s"] * len(movie_ids))
     sql = f"""
         SELECT
             mg.genre AS genre,
@@ -144,17 +180,14 @@ def query_genre_aggregation(movie_ids: list) -> pd.DataFrame:
         GROUP BY mg.genre
         ORDER BY avg_weighted_score DESC, movie_count DESC;
     """
-    df = pd.read_sql_query(sql, conn, params=movie_ids)
-    conn.close()
-    return df
+    return _fetch_df(sql, movie_ids)
 
 
 def query_ratings_for_movies(movie_ids: list) -> pd.DataFrame:
-    """Fetches individual cleaned audience ratings joined with movie details."""
+    """Fetches individual cleaned audience ratings joined with movie details from PostgreSQL."""
     if not movie_ids:
         return pd.DataFrame()
-    conn = get_connection()
-    placeholders = ",".join(["?"] * len(movie_ids))
+    placeholders = ",".join(["%s"] * len(movie_ids))
     sql = f"""
         SELECT
             r.rating_id,
@@ -173,9 +206,7 @@ def query_ratings_for_movies(movie_ids: list) -> pd.DataFrame:
         INNER JOIN movies m ON r.movie_id = m.movie_id
         WHERE r.movie_id IN ({placeholders});
     """
-    df = pd.read_sql_query(sql, conn, params=movie_ids)
-    conn.close()
-    return df
+    return _fetch_df(sql, movie_ids)
 
 
 def get_raw_datasets_preview() -> tuple:
@@ -186,25 +217,20 @@ def get_raw_datasets_preview() -> tuple:
 
 
 def execute_custom_sql(sql_query: str) -> pd.DataFrame:
-    """Executes a read-only SQL SELECT query for the SQL Workbench tab."""
+    """Executes a read-only PostgreSQL SELECT query for the SQL Workbench tab."""
     cleaned = sql_query.strip()
-    forbidden = ["DROP ", "DELETE ", "UPDATE ", "INSERT ", "ALTER ", "TRUNCATE ", "CREATE ", "REPLACE ", "ATTACH ", "DETACH ", "PRAGMA "]
+    forbidden = ["DROP ", "DELETE ", "UPDATE ", "INSERT ", "ALTER ", "TRUNCATE ", "CREATE ", "REPLACE ", "GRANT ", "REVOKE "]
     upper_q = cleaned.upper()
     if not (upper_q.startswith("SELECT") or upper_q.startswith("WITH")):
-        raise ValueError("Only read-only SELECT or WITH (CTE) queries are permitted in the SQL Explorer.")
+        raise ValueError("Only read-only SELECT or WITH (CTE) queries are permitted in the PostgreSQL Explorer.")
     for word in forbidden:
         if word in upper_q:
             raise ValueError(f"Operation '{word.strip()}' is disabled in read-only mode.")
-    conn = get_connection()
-    try:
-        df = pd.read_sql_query(cleaned, conn)
-        return df
-    finally:
-        conn.close()
+    return _fetch_df(cleaned)
 
 
 PREBUILT_SQL_QUERIES = {
-    "1. Top 15 Highest Weighted Movies (Multi-Table Join & Aggregation)": """SELECT 
+    "1. Top 15 Highest Weighted Movies (PostgreSQL Multi-Table Query)": """SELECT 
     m.movie_id,
     m.title,
     m.release_year,
@@ -220,7 +246,7 @@ WHERE m.rating_count >= 25
 ORDER BY m.weighted_score DESC, m.popularity_index DESC
 LIMIT 15;""",
 
-    "2. Genre Performance & Audience Preference Summary (Normalized Bridge Join)": """SELECT 
+    "2. Genre Performance & Audience Preference Summary (Normalized Bridge JOIN)": """SELECT 
     mg.genre AS Genre,
     COUNT(DISTINCT m.movie_id) AS Total_Movies,
     SUM(m.rating_count) AS Total_Audience_Votes,
@@ -267,7 +293,7 @@ FROM movies m
 GROUP BY m.decade
 ORDER BY m.decade;""",
 
-    "6. Data Pipeline ETL Audit Log": """SELECT 
+    "6. Data Pipeline ETL Audit Log (PostgreSQL Audit Table)": """SELECT 
     run_timestamp,
     raw_movies_rows,
     clean_movies_rows,

@@ -375,14 +375,14 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### ⚙️ Data Pipeline Control")
     st.caption(
-        f"**Warehouse:** `cinema_analytics.db` (SQLite)\n\n"
+        f"**Warehouse:** `PostgreSQL (movie_ratings_db)`\n\n"
         f"**Last ETL Run:** `{audit_stats.get('run_timestamp', 'N/A')}`"
     )
     if st.button("🔄 Re-Run Full ETL Data Pipeline", use_container_width=True):
-        with st.spinner("Regenerating raw datasets, deduplicating titles, imputing missing values, and rebuilding SQL tables..."):
+        with st.spinner("Regenerating raw datasets, deduplicating titles, imputing missing values, and rebuilding PostgreSQL tables..."):
             generate_raw_datasets()
             audit_stats = run_etl_pipeline()
-        st.success("ETL Pipeline & SQL Database refreshed!")
+        st.success("ETL Pipeline & PostgreSQL Database refreshed!")
         st.rerun()
 
 # ------------------------------------------------------------------------------
@@ -935,10 +935,10 @@ with tab_etl:
         st.markdown(
             f"""
             <div class="pipeline-step">
-                <div class="pipeline-step-title">4️⃣ SQL Joins & Aggregation</div>
+                <div class="pipeline-step-title">4️⃣ PostgreSQL Joins & Aggregation</div>
                 <div style="font-size:0.86rem; color:#FFE5D9;">
                     • Deduplicated <b>{audit_stats['duplicate_user_ratings_removed']}</b> repeat user votes<br>
-                    • Loaded <b>{audit_stats['clean_movies_rows']}</b> canonical films & <b>{audit_stats['clean_ratings_rows']:,}</b> ratings into SQLite
+                    • Loaded <b>{audit_stats['clean_movies_rows']}</b> canonical films & <b>{audit_stats['clean_ratings_rows']:,}</b> ratings into PostgreSQL
                 </div>
             </div>
             """,
@@ -1025,7 +1025,7 @@ with tab_etl:
 # TAB 5: SQL WAREHOUSE WORKBENCH
 # ==============================================================================
 with tab_sql:
-    st.markdown('<div class="section-header">Interactive SQL Query Workbench (SQLite Relational Warehouse)</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">Interactive SQL Query Workbench (PostgreSQL Relational Warehouse)</div>', unsafe_allow_html=True)
     st.caption(
         "Explore the normalized SQL schema (`movies`, `movie_genres`, `ratings`, `pipeline_audit`) "
         "using pre-built analytical joins or write your own custom `SELECT` query."
