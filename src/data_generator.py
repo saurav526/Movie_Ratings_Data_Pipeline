@@ -14,7 +14,7 @@ import random
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-
+# seed represent 42 = which means the answer to life, the universe, and everything in Douglas Adams' "The Hitchhiker's Guide to the Galaxy"
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
