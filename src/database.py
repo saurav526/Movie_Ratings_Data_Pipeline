@@ -3,7 +3,7 @@ PostgreSQL Analytics & Query Engine for Movie Ratings Data Pipeline
 Provides parameterized SQL queries against the PostgreSQL relational warehouse (`movie_ratings_db`)
 for filtering, aggregations, genre matrices, top-rated leaderboards, and interactive SQL exploration.
 """
-
+# use postgresql psycopg2 for direct SQL queries to the database
 import os
 import json
 import pandas as pd
