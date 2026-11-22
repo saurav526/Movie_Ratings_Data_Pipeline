@@ -21,6 +21,9 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 
+# --- IGNORE ---
+# ETL pipeline and SQL warehouse engine for movie ratings data. The database used is SQLite, but the schema and queries are compatible with PostgreSQL for future scalability.
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
 PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
